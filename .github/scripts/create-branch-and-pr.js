@@ -127,6 +127,7 @@ module.exports = async function createBranchAndPR({ github, context, core }) {
     ``,
     `## Description`,
     ``,
+    `<!-- profile-yaml-b64 -->`,
     issue.body || '_No description provided._',
   ].join('\n');
 
@@ -152,6 +153,68 @@ module.exports = async function createBranchAndPR({ github, context, core }) {
     log.info(`Tracking file committed: ${trackingPath}`);
   } catch (err) {
     log.warn(`Could not commit tracking file: ${err.message}`);
+  }
+
+  // ── 4b. Decode and store the profile YAML ────────────────────────────────────
+  const b64Body = (issue.body || '').trim();
+  if (b64Body) {
+    let profileYaml;
+    try {
+      profileYaml = Buffer.from(b64Body, 'base64').toString('utf8');
+    } catch (err) {
+      log.warn(`Could not decode base64 body for issue #${issue.number}: ${err.message}`);
+    }
+
+    if (profileYaml) {
+      // Extract the username field from the decoded YAML.
+      // Handles plain scalars and single/double-quoted YAML strings.
+      const usernameMatch = profileYaml.match(/^username:\s*(?:'([^']*)'|"([^"]*)"|(\S+))\s*$/m);
+      const username = usernameMatch
+        ? (usernameMatch[1] ?? usernameMatch[2] ?? usernameMatch[3] ?? '').trim() || null
+        : null;
+
+      if (username) {
+        const profilePath = `profiles/${username}/profile.yml`;
+        log.debug(`Writing profile file: ${profilePath}`);
+        try {
+          // Check if file already exists (to get its SHA for updates)
+          let existingSha;
+          try {
+            const { data: existing } = await withRetry('repos.getContent (profile)', () =>
+              github.rest.repos.getContent({ ...repo, path: profilePath, ref: branchName })
+            );
+            existingSha = existing.sha;
+            log.debug(`Profile file already exists (SHA: ${existingSha}) – will update.`);
+          } catch (e) {
+            if (e.status !== 404) throw e;
+          }
+
+          await withRetry('repos.createOrUpdateFileContents (profile)', () =>
+            github.rest.repos.createOrUpdateFileContents({
+              ...repo,
+              path: profilePath,
+              message: `feat: add profile for ${username} (issue #${issue.number})`,
+              content: Buffer.from(profileYaml).toString('base64'),
+              branch: branchName,
+              ...(existingSha ? { sha: existingSha } : {}),
+              committer: {
+                name: 'github-actions[bot]',
+                email: 'github-actions[bot]@users.noreply.github.com',
+              },
+              author: {
+                name: 'github-actions[bot]',
+                email: 'github-actions[bot]@users.noreply.github.com',
+              },
+            })
+          );
+          log.info(`Profile file committed: ${profilePath}`);
+        } catch (err) {
+          log.warn(`Could not commit profile file: ${err.message}`);
+        }
+      } else {
+        log.warn(`Could not extract username from decoded profile YAML for issue #${issue.number}`);
+      }
+    }
   }
 
   // ── 5. Create draft PR ───────────────────────────────────────────────────────
