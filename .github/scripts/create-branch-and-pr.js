@@ -166,9 +166,12 @@ module.exports = async function createBranchAndPR({ github, context, core }) {
     }
 
     if (profileYaml) {
-      // Extract the username field from the decoded YAML (simple regex, no YAML parser needed)
-      const usernameMatch = profileYaml.match(/^username:\s*(.+)$/m);
-      const username = usernameMatch ? usernameMatch[1].trim() : null;
+      // Extract the username field from the decoded YAML.
+      // Handles plain scalars and single/double-quoted YAML strings.
+      const usernameMatch = profileYaml.match(/^username:\s*(?:'([^']*)'|"([^"]*)"|(\S+))\s*$/m);
+      const username = usernameMatch
+        ? (usernameMatch[1] ?? usernameMatch[2] ?? usernameMatch[3] ?? '').trim() || null
+        : null;
 
       if (username) {
         const profilePath = `profiles/${username}/profile.yml`;
