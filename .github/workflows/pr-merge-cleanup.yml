@@ -1,0 +1,81 @@
+name: PR Merge - Close Issue & Delete Branch
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  cleanup-on-merge:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Close linked issues and delete feature branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+            const branchName = pr.head.ref;
+
+            // ── 1. Delete the feature branch ────────────────────────────────
+            try {
+              await github.rest.git.deleteRef({
+                ...repo,
+                ref: `heads/${branchName}`,
+              });
+              console.log(`Deleted branch: ${branchName}`);
+            } catch (e) {
+              console.warn(`Could not delete branch "${branchName}": ${e.message}`);
+            }
+
+            // ── 2. Close any issues referenced in the PR body ───────────────
+            //   Supports: closes/close/closed/fix/fixes/fixed/resolve/resolves/resolved #N
+            const body = pr.body || '';
+            const pattern = /(?:closes?|closed|fix(?:es|ed)?|resolves?|resolved)\s+#(\d+)/gi;
+            const matched = new Set();
+            let m;
+            while ((m = pattern.exec(body)) !== null) {
+              matched.add(parseInt(m[1], 10));
+            }
+
+            // Also close an issue whose number matches the branch name pattern issue-N
+            const branchMatch = branchName.match(/^issue-(\d+)$/);
+            if (branchMatch) {
+              matched.add(parseInt(branchMatch[1], 10));
+            }
+
+            for (const issueNumber of matched) {
+              try {
+                const { data: issue } = await github.rest.issues.get({
+                  ...repo,
+                  issue_number: issueNumber,
+                });
+                if (issue.state === 'open') {
+                  await github.rest.issues.update({
+                    ...repo,
+                    issue_number: issueNumber,
+                    state: 'closed',
+                    state_reason: 'completed',
+                  });
+                  await github.rest.issues.createComment({
+                    ...repo,
+                    issue_number: issueNumber,
+                    body: [
+                      `🤖 **Issue closed automatically.**`,
+                      ``,
+                      `This issue was resolved and closed after PR #${pr.number} was merged.`,
+                    ].join('\n'),
+                  });
+                  console.log(`Closed issue #${issueNumber}`);
+                } else {
+                  console.log(`Issue #${issueNumber} is already closed – skipping.`);
+                }
+              } catch (e) {
+                console.warn(`Could not process issue #${issueNumber}: ${e.message}`);
+              }
+            }
