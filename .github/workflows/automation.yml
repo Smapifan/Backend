@@ -1,0 +1,285 @@
+name: Repository Automation
+
+on:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [closed]
+  push:
+    branches: [main, master]
+  schedule:
+    # Runs daily at 02:00 UTC
+    - cron: '0 2 * * *'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1 – Issue opened: create feature branch + draft PR
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  create-branch-and-pr:
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Create feature branch and draft PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const branchName = `issue-${issue.number}`;
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+
+            // Resolve default branch
+            const { data: repoData } = await github.rest.repos.get(repo);
+            const defaultBranch = repoData.default_branch;
+
+            // Get SHA of the default branch tip
+            const { data: ref } = await github.rest.git.getRef({
+              ...repo,
+              ref: `heads/${defaultBranch}`,
+            });
+            const baseSha = ref.object.sha;
+
+            // Create the feature branch (skip if it already exists)
+            try {
+              await github.rest.git.createRef({
+                ...repo,
+                ref: `refs/heads/${branchName}`,
+                sha: baseSha,
+              });
+              console.log(`Created branch: ${branchName}`);
+            } catch (e) {
+              if (e.status === 422) {
+                console.log(`Branch "${branchName}" already exists – skipping creation.`);
+              } else {
+                throw e;
+              }
+            }
+
+            // Add a tracking file so the branch differs from base
+            const fileContent = [
+              `# Issue #${issue.number}: ${issue.title}`,
+              ``,
+              `**Opened by:** @${issue.user.login}`,
+              `**URL:** ${issue.html_url}`,
+              ``,
+              `## Description`,
+              ``,
+              issue.body || '_No description provided._',
+            ].join('\n');
+
+            try {
+              await github.rest.repos.createOrUpdateFileContents({
+                ...repo,
+                path: `.github/issues/issue-${issue.number}.md`,
+                message: `chore: track issue #${issue.number} – ${issue.title}`,
+                content: Buffer.from(fileContent).toString('base64'),
+                branch: branchName,
+                committer: {
+                  name: 'github-actions[bot]',
+                  email: 'github-actions[bot]@users.noreply.github.com',
+                },
+                author: {
+                  name: 'github-actions[bot]',
+                  email: 'github-actions[bot]@users.noreply.github.com',
+                },
+              });
+              console.log(`Created tracking file for issue #${issue.number}`);
+            } catch (e) {
+              console.warn(`Could not create tracking file: ${e.message}`);
+            }
+
+            // Open a draft PR referencing the issue
+            const prBody = [
+              `Closes #${issue.number}`,
+              ``,
+              `---`,
+              `> 🤖 This pull request was automatically generated for issue #${issue.number}.`,
+              `> Implement your changes on the \`${branchName}\` branch, then mark this PR as ready for review.`,
+            ].join('\n');
+
+            let pr;
+            try {
+              const { data } = await github.rest.pulls.create({
+                ...repo,
+                title: `fix: resolve issue #${issue.number} – ${issue.title}`,
+                body: prBody,
+                head: branchName,
+                base: defaultBranch,
+                draft: true,
+              });
+              pr = data;
+              console.log(`Created PR #${pr.number}: ${pr.html_url}`);
+            } catch (e) {
+              console.warn(`Could not create PR: ${e.message}`);
+              return;
+            }
+
+            // Comment on the issue with links
+            await github.rest.issues.createComment({
+              ...repo,
+              issue_number: issue.number,
+              body: [
+                `🤖 **Automated setup complete!**`,
+                ``,
+                `| | |`,
+                `|---|---|`,
+                `| **Branch** | [\`${branchName}\`](${pr.html_url}) |`,
+                `| **Pull Request** | [#${pr.number}](${pr.html_url}) |`,
+                ``,
+                `Push your changes to \`${branchName}\` and the PR will be ready for review.`,
+                `The issue will be closed automatically when the PR is merged.`,
+              ].join('\n'),
+            });
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 2 – PR merged: close linked issues + delete feature branch
+# ─────────────────────────────────────────────────────────────────────────────
+  cleanup-on-merge:
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Close linked issues and delete feature branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+            const branchName = pr.head.ref;
+
+            // ── 1. Delete the feature branch ──────────────────────────────────
+            try {
+              await github.rest.git.deleteRef({
+                ...repo,
+                ref: `heads/${branchName}`,
+              });
+              console.log(`Deleted branch: ${branchName}`);
+            } catch (e) {
+              console.warn(`Could not delete branch "${branchName}": ${e.message}`);
+            }
+
+            // ── 2. Close any issues referenced in the PR body ─────────────────
+            //   Supports: closes/close/closed/fix/fixes/fixed/resolve/resolves/resolved #N
+            const body = pr.body || '';
+            const pattern = /(?:closes?|closed|fix(?:es|ed)?|resolves?|resolved)\s+#(\d+)/gi;
+            const matched = new Set();
+            let m;
+            while ((m = pattern.exec(body)) !== null) {
+              matched.add(parseInt(m[1], 10));
+            }
+
+            // Also close an issue whose number matches the branch name pattern issue-N
+            const branchMatch = branchName.match(/^issue-(\d+)$/);
+            if (branchMatch) {
+              matched.add(parseInt(branchMatch[1], 10));
+            }
+
+            for (const issueNumber of matched) {
+              try {
+                const { data: issue } = await github.rest.issues.get({
+                  ...repo,
+                  issue_number: issueNumber,
+                });
+                if (issue.state === 'open') {
+                  await github.rest.issues.update({
+                    ...repo,
+                    issue_number: issueNumber,
+                    state: 'closed',
+                    state_reason: 'completed',
+                  });
+                  await github.rest.issues.createComment({
+                    ...repo,
+                    issue_number: issueNumber,
+                    body: [
+                      `🤖 **Issue closed automatically.**`,
+                      ``,
+                      `This issue was resolved and closed after PR #${pr.number} was merged.`,
+                    ].join('\n'),
+                  });
+                  console.log(`Closed issue #${issueNumber}`);
+                } else {
+                  console.log(`Issue #${issueNumber} is already closed – skipping.`);
+                }
+              } catch (e) {
+                console.warn(`Could not process issue #${issueNumber}: ${e.message}`);
+              }
+            }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 3 – Repo cleanup: remove junk files on push to default branch or daily
+# ─────────────────────────────────────────────────────────────────────────────
+  repo-cleanup:
+    if: >
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.actor != 'github-actions[bot]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Remove unnecessary files and directories
+        run: |
+          echo "=== Scanning for unnecessary files ==="
+
+          # ── Junk files (searched recursively across the whole tree) ──────────
+          find . \
+            -not -path './.git/*' \
+            \( \
+              -name '*.log'          \
+              -o -name '*.tmp'       \
+              -o -name '*~'          \
+              -o -name '*.bak'       \
+              -o -name '.DS_Store'   \
+              -o -name 'Thumbs.db'   \
+              -o -name '*.swp'       \
+              -o -name '*.swo'       \
+              -o -name '*.pyc'       \
+              -o -name '*.pyo'       \
+              -o -name 'ehthumbs.db' \
+              -o -name 'desktop.ini' \
+            \) -print -delete
+
+          # ── Junk directories ──────────────────────────────────────────────────
+          for dir_name in \
+            node_modules \
+            .vscode \
+            tmp \
+            __pycache__ \
+            .pytest_cache \
+            .mypy_cache \
+            .cache \
+            .nyc_output \
+          ; do
+            find . -not -path './.git/*' -type d -name "$dir_name" -prune -print \
+              -exec rm -rf '{}' \;
+          done
+
+          echo "=== Scan complete ==="
+
+      - name: Commit and push if changes exist
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "chore: auto-cleanup unnecessary files"
+            git push
+            echo "Cleanup commit pushed."
+          else
+            echo "Nothing to clean up – repo is already tidy."
+          fi
