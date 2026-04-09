@@ -2,13 +2,16 @@ name: Repo Cleanup
 
 on:
   push:
-    branches: ['**']
+    # Only run on the default branch to avoid unnecessary load on feature branches
+    branches: [main, master]
   schedule:
     # Runs daily at 02:00 UTC
     - cron: '0 2 * * *'
 
 jobs:
   cleanup:
+    # Skip if the pusher is github-actions[bot] to prevent an infinite push loop
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,52 +20,48 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # Use the bot token so the commit is attributed to github-actions[bot]
           token: ${{ secrets.GITHUB_TOKEN }}
-          # Full checkout to allow pushing
           fetch-depth: 0
 
       - name: Remove unnecessary files and directories
         run: |
           echo "=== Scanning for unnecessary files ==="
 
-          # ── Junk files ──────────────────────────────────────────────────────
+          # ── Junk files (searched recursively across the whole tree) ─────────
           find . \
             -not -path './.git/*' \
             \( \
-              -name '*.log'       \
-              -o -name '*.tmp'    \
-              -o -name '*~'       \
-              -o -name '*.bak'    \
-              -o -name '.DS_Store'\
-              -o -name 'Thumbs.db'\
-              -o -name '*.swp'    \
-              -o -name '*.swo'    \
-              -o -name '*.pyc'    \
-              -o -name '*.pyo'    \
+              -name '*.log'          \
+              -o -name '*.tmp'       \
+              -o -name '*~'          \
+              -o -name '*.bak'       \
+              -o -name '.DS_Store'   \
+              -o -name 'Thumbs.db'   \
+              -o -name '*.swp'       \
+              -o -name '*.swo'       \
+              -o -name '*.pyc'       \
+              -o -name '*.pyo'       \
               -o -name 'ehthumbs.db' \
               -o -name 'desktop.ini' \
             \) -print -delete
 
-          # ── Junk directories ─────────────────────────────────────────────────
-          for dir in \
-            tmp \
-            .vscode \
+          # ── Junk directories (searched recursively, never deleted in .git) ──
+          # node_modules and .vscode are removed if mistakenly committed
+          # (they should be listed in .gitignore and never pushed).
+          # __pycache__, .pytest_cache, .mypy_cache, .cache, .nyc_output are
+          # generated artefacts that should not be committed.
+          for dir_name in \
             node_modules \
+            .vscode \
+            tmp \
             __pycache__ \
             .pytest_cache \
             .mypy_cache \
-            dist \
-            build \
             .cache \
-            coverage \
             .nyc_output \
-            out \
           ; do
-            if [ -d "$dir" ]; then
-              echo "Removing directory: $dir"
-              rm -rf "$dir"
-            fi
+            find . -not -path './.git/*' -type d -name "$dir_name" -prune -print \
+              -exec rm -rf '{}' \;
           done
 
           echo "=== Scan complete ==="
@@ -74,7 +73,7 @@ jobs:
 
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
-            git commit -m "chore: auto-cleanup unnecessary files [skip ci]"
+            git commit -m "chore: auto-cleanup unnecessary files"
             git push
             echo "Cleanup commit pushed."
           else
