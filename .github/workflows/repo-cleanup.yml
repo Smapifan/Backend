@@ -1,0 +1,82 @@
+name: Repo Cleanup
+
+on:
+  push:
+    branches: ['**']
+  schedule:
+    # Runs daily at 02:00 UTC
+    - cron: '0 2 * * *'
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Use the bot token so the commit is attributed to github-actions[bot]
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Full checkout to allow pushing
+          fetch-depth: 0
+
+      - name: Remove unnecessary files and directories
+        run: |
+          echo "=== Scanning for unnecessary files ==="
+
+          # ── Junk files ──────────────────────────────────────────────────────
+          find . \
+            -not -path './.git/*' \
+            \( \
+              -name '*.log'       \
+              -o -name '*.tmp'    \
+              -o -name '*~'       \
+              -o -name '*.bak'    \
+              -o -name '.DS_Store'\
+              -o -name 'Thumbs.db'\
+              -o -name '*.swp'    \
+              -o -name '*.swo'    \
+              -o -name '*.pyc'    \
+              -o -name '*.pyo'    \
+              -o -name 'ehthumbs.db' \
+              -o -name 'desktop.ini' \
+            \) -print -delete
+
+          # ── Junk directories ─────────────────────────────────────────────────
+          for dir in \
+            tmp \
+            .vscode \
+            node_modules \
+            __pycache__ \
+            .pytest_cache \
+            .mypy_cache \
+            dist \
+            build \
+            .cache \
+            coverage \
+            .nyc_output \
+            out \
+          ; do
+            if [ -d "$dir" ]; then
+              echo "Removing directory: $dir"
+              rm -rf "$dir"
+            fi
+          done
+
+          echo "=== Scan complete ==="
+
+      - name: Commit and push if changes exist
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "chore: auto-cleanup unnecessary files [skip ci]"
+            git push
+            echo "Cleanup commit pushed."
+          else
+            echo "Nothing to clean up – repo is already tidy."
+          fi
