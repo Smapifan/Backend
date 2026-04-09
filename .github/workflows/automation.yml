@@ -2,7 +2,7 @@ name: Repository Automation
 
 on:
   issues:
-    types: [opened]
+    types: [opened, reopened, labeled, unlabeled, assigned, unassigned, milestoned, demilestoned, edited, deleted, transferred, pinned, unpinned, locked, unlocked, closed]
   pull_request:
     types: [closed]
   push:
@@ -13,127 +13,33 @@ on:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 1 – Issue opened: create feature branch + draft PR
+# Each issue gets its own concurrency slot so up to 50 issues triggered within
+# seconds of each other all run in parallel without blocking one another.
+# Duplicate runs for the *same* issue are queued (not cancelled).
 # ─────────────────────────────────────────────────────────────────────────────
 jobs:
   create-branch-and-pr:
     if: github.event_name == 'issues' && github.event.action == 'opened'
     runs-on: ubuntu-latest
+    # One slot per issue number → parallel across different issues, serialised per issue
+    concurrency:
+      group: create-branch-issue-${{ github.event.issue.number }}
+      cancel-in-progress: false
     permissions:
       contents: write
       pull-requests: write
       issues: write
 
     steps:
+      - name: Checkout repository (needed for script file)
+        uses: actions/checkout@v4
+
       - name: Create feature branch and draft PR
         uses: actions/github-script@v7
         with:
           script: |
-            const issue = context.payload.issue;
-            const branchName = `issue-${issue.number}`;
-            const repo = { owner: context.repo.owner, repo: context.repo.repo };
-
-            // Resolve default branch
-            const { data: repoData } = await github.rest.repos.get(repo);
-            const defaultBranch = repoData.default_branch;
-
-            // Get SHA of the default branch tip
-            const { data: ref } = await github.rest.git.getRef({
-              ...repo,
-              ref: `heads/${defaultBranch}`,
-            });
-            const baseSha = ref.object.sha;
-
-            // Create the feature branch (skip if it already exists)
-            try {
-              await github.rest.git.createRef({
-                ...repo,
-                ref: `refs/heads/${branchName}`,
-                sha: baseSha,
-              });
-              console.log(`Created branch: ${branchName}`);
-            } catch (e) {
-              if (e.status === 422) {
-                console.log(`Branch "${branchName}" already exists – skipping creation.`);
-              } else {
-                throw e;
-              }
-            }
-
-            // Add a tracking file so the branch differs from base
-            const fileContent = [
-              `# Issue #${issue.number}: ${issue.title}`,
-              ``,
-              `**Opened by:** @${issue.user.login}`,
-              `**URL:** ${issue.html_url}`,
-              ``,
-              `## Description`,
-              ``,
-              issue.body || '_No description provided._',
-            ].join('\n');
-
-            try {
-              await github.rest.repos.createOrUpdateFileContents({
-                ...repo,
-                path: `.github/issues/issue-${issue.number}.md`,
-                message: `chore: track issue #${issue.number} – ${issue.title}`,
-                content: Buffer.from(fileContent).toString('base64'),
-                branch: branchName,
-                committer: {
-                  name: 'github-actions[bot]',
-                  email: 'github-actions[bot]@users.noreply.github.com',
-                },
-                author: {
-                  name: 'github-actions[bot]',
-                  email: 'github-actions[bot]@users.noreply.github.com',
-                },
-              });
-              console.log(`Created tracking file for issue #${issue.number}`);
-            } catch (e) {
-              console.warn(`Could not create tracking file: ${e.message}`);
-            }
-
-            // Open a draft PR referencing the issue
-            const prBody = [
-              `Closes #${issue.number}`,
-              ``,
-              `---`,
-              `> 🤖 This pull request was automatically generated for issue #${issue.number}.`,
-              `> Implement your changes on the \`${branchName}\` branch, then mark this PR as ready for review.`,
-            ].join('\n');
-
-            let pr;
-            try {
-              const { data } = await github.rest.pulls.create({
-                ...repo,
-                title: `fix: resolve issue #${issue.number} – ${issue.title}`,
-                body: prBody,
-                head: branchName,
-                base: defaultBranch,
-                draft: true,
-              });
-              pr = data;
-              console.log(`Created PR #${pr.number}: ${pr.html_url}`);
-            } catch (e) {
-              console.warn(`Could not create PR: ${e.message}`);
-              return;
-            }
-
-            // Comment on the issue with links
-            await github.rest.issues.createComment({
-              ...repo,
-              issue_number: issue.number,
-              body: [
-                `🤖 **Automated setup complete!**`,
-                ``,
-                `| | |`,
-                `|---|---|`,
-                `| **Branch** | [\`${branchName}\`](${pr.html_url}) |`,
-                `| **Pull Request** | [#${pr.number}](${pr.html_url}) |`,
-                ``,
-                `Push your changes to \`${branchName}\` and the PR will be ready for review.`,
-                `The issue will be closed automatically when the PR is merged.`,
-              ].join('\n'),
-            });
+            const run = require('./.github/scripts/create-branch-and-pr.js');
+            await run({ github, context, core });
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 2 – PR merged: close linked issues + delete feature branch
